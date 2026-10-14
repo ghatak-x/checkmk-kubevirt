@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -42,6 +43,9 @@ def _state_from_bool(value: Any, what: str) -> Result:
     return Result(state=State.UNKNOWN, summary=f"{what}: unknown")
 
 
+_LABEL_VALUE = re.compile(r"(?:[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?")
+
+
 def _host_labels_vm_info(section: Mapping[str, Any]) -> Iterable[HostLabel]:
     for key, value in section.get("labels", {}).items():
         if isinstance(value, Mapping):
@@ -49,7 +53,9 @@ def _host_labels_vm_info(section: Mapping[str, Any]) -> Iterable[HostLabel]:
         if value is not None:
             yield HostLabel(f"cmk/kubevirt/label/{key}", str(value))
     for key, value in section.get("annotations", {}).items():
-        yield HostLabel(f"cmk/kubevirt/annotation/{key}", str(value))
+        # Defense in depth for older collectors and externally supplied data.
+        if isinstance(value, str) and _LABEL_VALUE.fullmatch(value):
+            yield HostLabel(f"cmk/kubevirt/annotation/{key}", value)
     if ns := section.get("namespace"):
         yield HostLabel("cmk/kubevirt/namespace", str(ns))
     yield HostLabel("cmk/kubevirt/object", "virtualmachine")
@@ -67,41 +73,108 @@ def _check_vm_info(section: Mapping[str, Any]) -> Iterable[Result]:
     yield Result(state=State.OK, notice=f"Disks: {len(disks)}, volumes: {len(volumes)}")
 
 
-def _check_vm_status(section: Mapping[str, Any]) -> Iterable[Result]:
-    printable = section.get("printable_status") or section.get("phase") or "unknown"
-    ready = section.get("ready")
-    if printable.lower() == "running" and ready is not False:
-        state = State.OK
-    elif printable.lower() in {"error", "crashloopbackoff", "failed"}:
-        state = State.CRIT
-    elif ready is False:
-        state = State.WARN
-    else:
-        state = State.UNKNOWN
+# KubeVirt printableStatus refers to VM lifecycle, not automatically to health.
+# Unknown/new statuses deliberately remain UNKNOWN so upstream changes are visible.
+_VM_TRANSIENT = {
+    "starting", "provisioning", "migrating", "stopping", "terminating",
+    "scheduling", "waitingforvolumebinding", "pending",
+}
+_VM_FAILED = {
+    "error", "failed", "crashloopbackoff", "errimagepull", "imagepullbackoff",
+    "failedunschedulable", "unschedulable", "datavolumeerror", "failedpvcnotfound", "pvcnotfound",
+}
+# Some transient statuses have no active VMI while a new instance is prepared.
+_VM_NO_RUNTIME = _VM_TRANSIENT | {"stopped", "paused"}
+
+
+def _vm_state(section: Mapping[str, Any], params: Mapping[str, Any]) -> tuple[State, str]:
+    printable = str(section.get("printable_status") or section.get("phase") or "Unknown")
+    normalized = printable.casefold().replace(" ", "")
+    strategy = str(section.get("run_strategy") or "")
+    desired_running = section.get("desired_running")
+    if normalized in _VM_FAILED:
+        return State.CRIT, printable
+    if normalized == "running":
+        return (State.WARN if section.get("ready") is False else State.OK), printable
+    if normalized == "stopped":
+        intentional = strategy.casefold() in {"halted", "manual"} or desired_running is False
+        state_key = "stopped_state" if intentional else "unexpected_stopped_state"
+        return State(params.get(state_key, State.OK.value if intentional else State.CRIT.value)), printable
+    if normalized == "paused":
+        return State(params.get("paused_state", State.WARN.value)), printable
+    if normalized in _VM_TRANSIENT:
+        return State(params.get("transient_state", State.OK.value)), printable
+    return State.UNKNOWN, printable
+
+
+def _check_vm_status(params: Mapping[str, Any], section: Mapping[str, Any]) -> Iterable[Result]:
+    state, printable = _vm_state(section, params)
     yield Result(state=state, summary=f"Status: {printable}")
-    if ready is not None:
-        yield _state_from_bool(ready, "Ready")
+    if section.get("ready") is not None:
+        # A stopped/paused/provisioning VM is naturally not ready. Do not
+        # override the lifecycle-based result with a second CRIT result.
+        ready_state = State.WARN if printable.casefold() == "running" and section["ready"] is False else State.OK
+        yield Result(state=ready_state, notice=f"Ready: {section['ready']}")
     if section.get("created") is not None:
-        yield Result(state=State.OK, notice=f"Created: {section.get('created')}")
+        yield Result(state=State.OK, notice=f"Created: {section['created']}")
+    if strategy := section.get("run_strategy"):
+        yield Result(state=State.OK, notice=f"Run strategy: {strategy}")
     for cond in section.get("conditions", []):
         ctype = cond.get("type")
-        status = cond.get("status")
         if ctype:
-            yield Result(state=State.OK, notice=f"Condition {ctype}: {status}")
+            yield Result(state=State.OK, notice=f"Condition {ctype}: {cond.get('status')}")
 
 
-def _check_vm_placement(section: Mapping[str, Any]) -> Iterable[Result]:
-    node = section.get("node")
+def _runtime_not_expected(section: Mapping[str, Any] | None) -> bool:
+    if not section:
+        return False
+    printable = str(section.get("printable_status") or "").casefold().replace(" ", "")
+    return printable in _VM_NO_RUNTIME
+
+
+def _discover_vm_placement(
+    section_kubevirt_vm_placement_v1: Mapping[str, Any] | None,
+    section_kubevirt_vm_status_v1: Mapping[str, Any] | None,
+) -> Iterable[Service]:
+    if section_kubevirt_vm_placement_v1 is not None:
+        yield Service()
+
+
+def _check_vm_placement(
+    section_kubevirt_vm_placement_v1: Mapping[str, Any] | None,
+    section_kubevirt_vm_status_v1: Mapping[str, Any] | None,
+) -> Iterable[Result]:
+    if section_kubevirt_vm_placement_v1 is None:
+        return
+    node = section_kubevirt_vm_placement_v1.get("node")
     if node:
         yield Result(state=State.OK, summary=f"Node: {node}")
+    elif _runtime_not_expected(section_kubevirt_vm_status_v1):
+        yield Result(state=State.OK, summary="No active node expected in current VM lifecycle state")
     else:
         yield Result(state=State.WARN, summary="No node assigned")
 
 
-def _check_vm_interfaces(section: Mapping[str, Any]) -> Iterable[Result]:
-    interfaces = section.get("interfaces") or []
+def _discover_vm_interfaces(
+    section_kubevirt_vm_interfaces_v1: Mapping[str, Any] | None,
+    section_kubevirt_vm_status_v1: Mapping[str, Any] | None,
+) -> Iterable[Service]:
+    if section_kubevirt_vm_interfaces_v1 is not None:
+        yield Service()
+
+
+def _check_vm_interfaces(
+    section_kubevirt_vm_interfaces_v1: Mapping[str, Any] | None,
+    section_kubevirt_vm_status_v1: Mapping[str, Any] | None,
+) -> Iterable[Result]:
+    if section_kubevirt_vm_interfaces_v1 is None:
+        return
+    interfaces = section_kubevirt_vm_interfaces_v1.get("interfaces") or []
     if not interfaces:
-        yield Result(state=State.WARN, summary="No interfaces found")
+        if _runtime_not_expected(section_kubevirt_vm_status_v1):
+            yield Result(state=State.OK, summary="No active interfaces expected in current VM lifecycle state")
+        else:
+            yield Result(state=State.WARN, summary="No runtime interfaces found")
         return
     yield Result(state=State.OK, summary=f"Interfaces: {len(interfaces)}")
     for iface in interfaces:
@@ -124,13 +197,11 @@ def _check_vm_resources(section: Mapping[str, Any]) -> Iterable[Result]:
 
 def _check_vm_cpu(params: Mapping[str, Any], section: Mapping[str, Any]) -> Iterable[Result]:
     usage = float(section.get("usage", 0.0))
-    yield Metric("kubevirt_vm_cpu_usage", usage)
     yield from check_levels(usage, levels_upper=params.get("levels_upper"), metric_name="kubevirt_vm_cpu_usage", label="CPU usage", render_func=lambda v: f"{v:.3f} cores")
 
 
 def _check_vm_memory(params: Mapping[str, Any], section: Mapping[str, Any]) -> Iterable[Result]:
     value = float(section.get("resident_bytes", 0.0))
-    yield Metric("kubevirt_vm_memory_resident", value)
     yield from check_levels(value, levels_upper=params.get("levels_upper"), metric_name="kubevirt_vm_memory_resident", label="Resident memory", render_func=render.bytes)
 
 
@@ -230,13 +301,13 @@ agent_section_kubevirt_vm_info = AgentSection(name="kubevirt_vm_info_v1", parse_
 check_plugin_kubevirt_vm_info = CheckPlugin(name="kubevirt_vm_info", service_name="VM info", sections=["kubevirt_vm_info_v1"], discovery_function=_discover_single, check_function=_check_vm_info)
 
 agent_section_kubevirt_vm_status = AgentSection(name="kubevirt_vm_status_v1", parse_function=_parse_json_section)
-check_plugin_kubevirt_vm_status = CheckPlugin(name="kubevirt_vm_status", service_name="VM status", sections=["kubevirt_vm_status_v1"], discovery_function=_discover_single, check_function=_check_vm_status)
+check_plugin_kubevirt_vm_status = CheckPlugin(name="kubevirt_vm_status", service_name="VM status", sections=["kubevirt_vm_status_v1"], discovery_function=_discover_single, check_function=_check_vm_status, check_default_parameters={}, check_ruleset_name="kubevirt_vm_status")
 
 agent_section_kubevirt_vm_placement = AgentSection(name="kubevirt_vm_placement_v1", parse_function=_parse_json_section)
-check_plugin_kubevirt_vm_placement = CheckPlugin(name="kubevirt_vm_placement", service_name="VM placement", sections=["kubevirt_vm_placement_v1"], discovery_function=_discover_single, check_function=_check_vm_placement)
+check_plugin_kubevirt_vm_placement = CheckPlugin(name="kubevirt_vm_placement", service_name="VM placement", sections=["kubevirt_vm_placement_v1", "kubevirt_vm_status_v1"], discovery_function=_discover_vm_placement, check_function=_check_vm_placement)
 
 agent_section_kubevirt_vm_interfaces = AgentSection(name="kubevirt_vm_interfaces_v1", parse_function=_parse_json_section)
-check_plugin_kubevirt_vm_interfaces = CheckPlugin(name="kubevirt_vm_interfaces", service_name="VM interfaces", sections=["kubevirt_vm_interfaces_v1"], discovery_function=_discover_single, check_function=_check_vm_interfaces)
+check_plugin_kubevirt_vm_interfaces = CheckPlugin(name="kubevirt_vm_interfaces", service_name="VM interfaces", sections=["kubevirt_vm_interfaces_v1", "kubevirt_vm_status_v1"], discovery_function=_discover_vm_interfaces, check_function=_check_vm_interfaces)
 
 agent_section_kubevirt_vm_resources = AgentSection(name="kubevirt_vm_resources_v1", parse_function=_parse_json_section)
 check_plugin_kubevirt_vm_resources = CheckPlugin(name="kubevirt_vm_resources", service_name="VM resources", sections=["kubevirt_vm_resources_v1"], discovery_function=_discover_single, check_function=_check_vm_resources)

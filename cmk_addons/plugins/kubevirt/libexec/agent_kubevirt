@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import sys
+from urllib.parse import urlsplit
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -26,6 +27,25 @@ import urllib3
 from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
 
 LOG = logging.getLogger("agent_kubevirt")
+
+# Kubernetes annotation values may contain multiline JSON or secrets. Only
+# label-compatible values are eligible for Checkmk host labels.
+LABEL_VALUE = re.compile(r"(?:[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?")
+
+
+def valid_annotation_value(value: object) -> bool:
+    return isinstance(value, str) and LABEL_VALUE.fullmatch(value) is not None
+
+
+def validate_prometheus_token_transport(endpoint: str, verify_certificate: bool) -> None:
+    """Reject insecure destinations for a separately configured Prometheus credential."""
+    parsed = urlsplit(endpoint)
+    loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme == "https" and (verify_certificate or loopback):
+        return
+    if parsed.scheme == "http" and loopback:
+        return
+    raise ValueError("Prometheus bearer authentication requires verified HTTPS (or a loopback endpoint)")
 
 KUBEVIRT_QUERIES = {
     "cpu": 'sum(rate(kubevirt_vmi_cpu_usage_seconds_total[5m])) by (exported_namespace, name)',
@@ -76,6 +96,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--include-annotations-as-host-labels", action="store_true")
     p.add_argument("--include-matching-annotations-as-host-labels")
     p.add_argument("--prometheus-endpoint")
+    parser_add_secret_option(p, long="--prometheus-token", help="Optional, separate Prometheus bearer token", required=False)
     p.add_argument("--usage-proxy", default="FROM_ENVIRONMENT")
     p.add_argument("--usage-verify-cert", action="store_true")
     p.add_argument("--usage-connect-timeout", type=int, default=10)
@@ -103,6 +124,12 @@ def _resolve_token(args: argparse.Namespace) -> str:
     return resolve_secret_option(args, "token").reveal()
 
 
+def _resolve_prometheus_token(args: argparse.Namespace) -> str | None:
+    if not (getattr(args, "prometheus_token", None) or getattr(args, "prometheus_token_id", None)):
+        return None
+    return resolve_secret_option(args, "prometheus_token").reveal()
+
+
 def _proxy(value: str) -> Mapping[str, str] | None:
     if value == "FROM_ENVIRONMENT":
         return None
@@ -112,7 +139,11 @@ def _proxy(value: str) -> Mapping[str, str] | None:
 
 
 def _get_json(session: requests.Session, url: str, **kwargs: Any) -> Mapping[str, Any]:
-    response = session.get(url, **kwargs)
+    # Reject redirects rather than forwarding credentials or silently moving to
+    # a different endpoint.
+    response = session.get(url, allow_redirects=False, **kwargs)
+    if 300 <= response.status_code < 400:
+        raise RuntimeError(f"HTTP redirect refused for monitoring endpoint: {url}")
     response.raise_for_status()
     data = response.json()
     if not isinstance(data, Mapping):
@@ -159,10 +190,10 @@ def _vm_section_data(vm: Mapping[str, Any], vmi: Mapping[str, Any] | None, clust
 
     raw_annotations = meta.get("annotations") or {}
     if import_annotations:
-        annotations = raw_annotations
+        annotations = {k: v for k, v in raw_annotations.items() if valid_annotation_value(v)}
     elif annotation_pattern:
         regex = re.compile(annotation_pattern)
-        annotations = {k: v for k, v in raw_annotations.items() if regex.search(k)}
+        annotations = {k: v for k, v in raw_annotations.items() if regex.search(k) and valid_annotation_value(v)}
     else:
         annotations = {}
 
@@ -194,6 +225,8 @@ def _vm_section_data(vm: Mapping[str, Any], vmi: Mapping[str, Any] | None, clust
         },
         "kubevirt_vm_status_v1": {
             "printable_status": status.get("printableStatus"),
+            "run_strategy": spec.get("runStrategy"),
+            "desired_running": spec.get("running"),
             "ready": status.get("ready"),
             "created": status.get("created"),
             "phase": vmi_status.get("phase"),
@@ -271,9 +304,11 @@ def _vm_key(metric: Mapping[str, Any]) -> tuple[str, str]:
     return (str(metric.get("exported_namespace") or metric.get("namespace") or "default"), str(metric.get("name") or metric.get("domain") or metric.get("vm") or "unknown"))
 
 
-def collect_prometheus(args: argparse.Namespace, token: str) -> None:
+def collect_prometheus(args: argparse.Namespace, prometheus_token: str | None = None) -> None:
     if not args.prometheus_endpoint:
         return
+    if prometheus_token:
+        validate_prometheus_token_transport(args.prometheus_endpoint, args.usage_verify_cert)
     if not args.usage_verify_cert:
         LOG.warning("Disabling SSL certificate verification for Prometheus endpoint.")
     kwargs = {
@@ -282,7 +317,8 @@ def collect_prometheus(args: argparse.Namespace, token: str) -> None:
         "proxies": _proxy(args.usage_proxy),
     }
     with requests.Session() as session:
-        session.headers.update({"Authorization": f"Bearer {token}"})
+        if prometheus_token:
+            session.headers.update({"Authorization": f"Bearer {prometheus_token}"})
         results = {name: prom_query(session, args.prometheus_endpoint, query, **kwargs) for name, query in KUBEVIRT_QUERIES.items()}
 
     per_vm: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"net": defaultdict(dict), "disk": defaultdict(dict)})
@@ -342,13 +378,16 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     args = parse_args(argv)
     setup_logging(args.verbose)
-    LOG.debug("parsed arguments: %r", args)
+    # Never log argparse's Namespace here: it may include explicit bearer tokens.
     if not args.verify_cert_api or (args.prometheus_endpoint and not args.usage_verify_cert):
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     try:
         token = _resolve_token(args)
+        prometheus_token = _resolve_prometheus_token(args)
+        if prometheus_token and args.prometheus_endpoint:
+            validate_prometheus_token_transport(args.prometheus_endpoint, args.usage_verify_cert)
         collect_api(args, token)
-        collect_prometheus(args, token)
+        collect_prometheus(args, prometheus_token)
     except Exception as exc:
         if args.debug:
             raise
