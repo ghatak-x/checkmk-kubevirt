@@ -37,8 +37,8 @@ Build the MKP locally or download it from a GitHub release / Checkmk Exchange pa
 
 ```bash
 python tools/build_mkp.py
-mkp add dist/kubevirt-0.1.1.mkp
-mkp enable kubevirt 0.1.0
+mkp add dist/kubevirt-0.1.2.mkp
+mkp enable kubevirt 0.1.2
 cmk -R
 ```
 
@@ -103,3 +103,30 @@ the Kubernetes token must be configured with their own token after upgrading.
 VMs deliberately stopped or in normal transitional lifecycle states no longer
 trigger false placement/interface warnings. Status handling defaults are
 configurable; unknown new status values remain UNKNOWN.
+
+## Prometheus failure isolation (v0.1.2)
+
+Prometheus collection is optional and independent of the Kubernetes/KubeVirt API.
+If a configured Prometheus endpoint fails to authenticate (401/403), times out,
+returns invalid or failed query data, or violates the bearer-token transport
+policy, API-sourced VM monitoring continues. A new **KubeVirt Prometheus
+connection** service appears on the source host after service discovery and
+reports **CRIT** with a safe, actionable error description; it becomes **OK**
+when Prometheus queries work again. No such service is discovered when no
+Prometheus endpoint is configured.
+
+Metrics from Prometheus (VM CPU, resident memory, disk and network performance,
+and KubeVirt platform metrics) are not refreshed when collection fails. Review
+Checkmk's missing-data/staleness handling for existing metrics services.
+
+**Credential migration reminder:** v0.1.0 reused the Kubernetes API bearer
+token for Prometheus; v0.1.1 and later do **not**. For authenticated Prometheus
+endpoints such as OpenShift Thanos Querier, configure **Prometheus bearer
+token** separately. This setting is not automatically migrated. Remote bearer
+authentication requires verified HTTPS. For a self-signed certificate, install
+and trust the issuing CA, or use a localhost port-forward for testing. Unverified
+remote TLS endpoints are intentionally refused rather than leaking tokens.
+
+After installing v0.1.2, rediscover services on the KubeVirt source host to
+pick up the new connection service. Existing VM piggyback host names remain
+unchanged.

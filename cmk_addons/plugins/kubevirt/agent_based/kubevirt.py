@@ -296,6 +296,15 @@ def _check_lifecycle(section: Mapping[str, Any]) -> Iterable[Result]:
     yield Result(state=State.OK, summary=f"Running VMs with lifecycle timestamp: {len(running)}")
 
 
+def _check_prometheus_connection(section: Mapping[str, Any]) -> Iterable[Result]:
+    if section.get("ok") is True:
+        yield Result(state=State.OK, summary="Prometheus queries completed successfully")
+    elif section.get("ok") is False:
+        yield Result(state=State.CRIT, summary=str(section.get("message") or "Prometheus collection failed"))
+    else:
+        yield Result(state=State.UNKNOWN, summary="Invalid Prometheus connection status")
+
+
 # API sections
 agent_section_kubevirt_vm_info = AgentSection(name="kubevirt_vm_info_v1", parse_function=_parse_json_section, host_label_function=_host_labels_vm_info)
 check_plugin_kubevirt_vm_info = CheckPlugin(name="kubevirt_vm_info", service_name="VM info", sections=["kubevirt_vm_info_v1"], discovery_function=_discover_single, check_function=_check_vm_info)
@@ -346,3 +355,7 @@ check_plugin_kubevirt_vmi_phase_count = CheckPlugin(name="kubevirt_vmi_phase_cou
 
 agent_section_kubevirt_vm_lifecycle = AgentSection(name="kubevirt_vm_lifecycle_v1", parse_function=_parse_json_section)
 check_plugin_kubevirt_vm_lifecycle = CheckPlugin(name="kubevirt_vm_lifecycle", service_name="KubeVirt VM lifecycle", sections=["kubevirt_vm_lifecycle_v1"], discovery_function=_discover_single, check_function=_check_lifecycle)
+
+# Source-host status: Prometheus failure must be visible even if no metrics arrive.
+agent_section_kubevirt_prometheus_connection = AgentSection(name="kubevirt_prometheus_connection_v1", parse_function=_parse_json_section)
+check_plugin_kubevirt_prometheus_connection = CheckPlugin(name="kubevirt_prometheus_connection", service_name="KubeVirt Prometheus connection", sections=["kubevirt_prometheus_connection_v1"], discovery_function=_discover_single, check_function=_check_prometheus_connection)

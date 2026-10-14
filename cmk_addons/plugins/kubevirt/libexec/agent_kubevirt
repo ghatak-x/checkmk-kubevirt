@@ -281,9 +281,13 @@ def collect_api(args: argparse.Namespace, token: str) -> None:
 def prom_query(session: requests.Session, base_url: str, promql: str, **kwargs: Any) -> list[Mapping[str, Any]]:
     data = _get_json(session, base_url.rstrip("/") + "/api/v1/query", params={"query": promql}, **kwargs)
     if data.get("status") != "success":
-        LOG.warning("Prometheus query failed: %s", promql)
-        return []
-    result = ((data.get("data") or {}).get("result") or [])
+        # A failed query is a collection error, not a successful empty vector.
+        # Never include server-provided error strings (or credentials) in output.
+        raise RuntimeError("Prometheus API returned a failed query status")
+    payload = data.get("data")
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("result"), list):
+        raise RuntimeError("Prometheus API returned an invalid query result")
+    result = payload["result"]
     return [sample for sample in result if isinstance(sample, Mapping)]
 
 
@@ -373,6 +377,42 @@ def collect_prometheus(args: argparse.Namespace, prometheus_token: str | None = 
     _write_pb("", platform)
 
 
+def _prometheus_failure_summary(exc: Exception) -> str:
+    """Return a useful error without exposing URLs, tokens or server payloads.
+
+    requests exceptions can contain credentials embedded in endpoint URLs.
+    Never display their raw exception messages in an agent section or log.
+    """
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        status = response.status_code if response is not None else None
+        if status in (401, 403):
+            return f"HTTP {status}: Prometheus authentication/authorization failed"
+        if status is not None:
+            return f"HTTP {status}: Prometheus request failed"
+        return "Prometheus request failed (HTTP error)"
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "Prometheus TLS certificate validation failed"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "Prometheus connection timed out"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "Prometheus connection failed"
+    if isinstance(exc, requests.exceptions.RequestException):
+        return "Prometheus HTTP request failed"
+    if isinstance(exc, ValueError) and str(exc).startswith("Prometheus bearer authentication requires"):
+        return "Prometheus bearer token requires verified HTTPS or a loopback endpoint"
+    if isinstance(exc, RuntimeError) and str(exc).startswith("HTTP redirect refused"):
+        return "Prometheus HTTP redirect refused"
+    if isinstance(exc, RuntimeError) and str(exc).startswith("Prometheus API returned"):
+        return str(exc)
+    return f"Prometheus collection failed ({type(exc).__name__})"
+
+
+def _emit_prometheus_health(ok: bool, message: str) -> None:
+    # Empty piggyback name means source host, even after preceding VM sections.
+    _write_pb("", {"kubevirt_prometheus_connection_v1": {"ok": ok, "message": message}})
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -383,16 +423,27 @@ def main(argv: list[str] | None = None) -> int:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     try:
         token = _resolve_token(args)
-        prometheus_token = _resolve_prometheus_token(args)
-        if prometheus_token and args.prometheus_endpoint:
-            validate_prometheus_token_transport(args.prometheus_endpoint, args.usage_verify_cert)
         collect_api(args, token)
-        collect_prometheus(args, prometheus_token)
     except Exception as exc:
+        # Kubernetes API collection is mandatory; preserving its failure signal
+        # avoids silently reporting empty VM inventories as healthy.
         if args.debug:
             raise
         sys.stderr.write(str(exc) + "\n")
         return 1
+
+    # Prometheus is optional. A broken metrics endpoint, invalid Prometheus
+    # password-store entry or unsafe transport must not suppress API VM data.
+    if args.prometheus_endpoint:
+        try:
+            prometheus_token = _resolve_prometheus_token(args)
+            collect_prometheus(args, prometheus_token)
+        except Exception as exc:
+            message = _prometheus_failure_summary(exc)
+            sys.stderr.write(f"Prometheus: {message}\n")
+            _emit_prometheus_health(False, message)
+        else:
+            _emit_prometheus_health(True, "Prometheus queries completed successfully")
     return 0
 
 
