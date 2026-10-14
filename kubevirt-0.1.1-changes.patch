@@ -1,0 +1,781 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6a45e9c..299146c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,13 @@
+ # Changelog
+ 
++## 0.1.1
++
++- Separate optional Prometheus bearer authentication from the Kubernetes API credential; do not forward credentials across redirects.
++- Import only Kubernetes label-compatible annotation values as host labels.
++- Add VM CPU, resident memory, and lifecycle status monitoring rules under service monitoring rules.
++- Make VM status, node placement, and runtime interfaces aware of stopped and transient VM lifecycles.
++- Add regression coverage for credential isolation, annotation filtering, and VM status behavior.
++
+ ## 0.1.0
+ 
+-Initial public release.
++- Initial public release.
+diff --git a/README.md b/README.md
+index 7c67669..e1ba122 100644
+--- a/README.md
++++ b/README.md
+@@ -37,7 +37,7 @@ Build the MKP locally or download it from a GitHub release / Checkmk Exchange pa
+ 
+ ```bash
+ python tools/build_mkp.py
+-mkp add dist/kubevirt-0.1.0.mkp
++mkp add dist/kubevirt-0.1.1.mkp
+ mkp enable kubevirt 0.1.0
+ cmk -R
+ ```
+@@ -85,3 +85,21 @@ python tools/build_mkp.py
+ ## License
+ 
+ GPL-2.0-only. See `LICENSE`.
++
++## Monitoring policies and authentication (v0.1.1)
++
++The VM CPU, VM resident memory, and VM lifecycle status checks now support
++**Setup → Services → Service monitoring rules**. CPU values are measured in
++CPU cores, and resident memory is measured in bytes.
++
++Prometheus runs without authentication by default, independently from the
++Kubernetes API token. If Prometheus requires a bearer token, configure a
++**separate Prometheus bearer token** in the special-agent rule. Authenticated
++remote Prometheus requests require TLS certificate verification; for lab
++port-forwards a localhost endpoint is also supported. HTTP redirects are
++rejected. Existing Prometheus endpoints previously relying on implicit reuse of
++the Kubernetes token must be configured with their own token after upgrading.
++
++VMs deliberately stopped or in normal transitional lifecycle states no longer
++trigger false placement/interface warnings. Status handling defaults are
++configurable; unknown new status values remain UNKNOWN.
+diff --git a/RELEASE_NOTES.md b/RELEASE_NOTES.md
+new file mode 100644
+index 0000000..c59185f
+--- /dev/null
++++ b/RELEASE_NOTES.md
+@@ -0,0 +1,11 @@
++# KubeVirt v0.1.1
++
++Patch release addressing community review feedback:
++
++- Fixed implicit forwarding of the Kubernetes API bearer token to the independently configured Prometheus endpoint. Prometheus authentication is now separate, optional, and requires a verified HTTPS endpoint for remote destinations (loopback allowed for local port forwards). HTTP redirects are rejected.
++- Validated VM annotation values against Kubernetes label-value syntax before importing host labels.
++- Added configurable service monitoring rules for VM CPU usage (cores), VM resident memory (bytes), and VM lifecycle state.
++- Improved lifecycle state classification and removed false placement/interface WARN states for stopped and transitional VMs.
++- Added regression tests.
++
++**Upgrade note:** If Prometheus previously relied on the Kubernetes API token being forwarded implicitly, configure a dedicated Prometheus bearer token in the special-agent rule. If Prometheus is publicly readable, no credential is needed. Checkmk 2.5 required.
+diff --git a/cmk_addons/plugins/kubevirt/agent_based/kubevirt.py b/cmk_addons/plugins/kubevirt/agent_based/kubevirt.py
+index 3ee6cf7..adc6a72 100644
+--- a/cmk_addons/plugins/kubevirt/agent_based/kubevirt.py
++++ b/cmk_addons/plugins/kubevirt/agent_based/kubevirt.py
+@@ -7,6 +7,7 @@
+ from __future__ import annotations
+ 
+ import json
++import re
+ from collections.abc import Iterable, Mapping
+ from typing import Any
+ 
+@@ -42,6 +43,9 @@ def _state_from_bool(value: Any, what: str) -> Result:
+     return Result(state=State.UNKNOWN, summary=f"{what}: unknown")
+ 
+ 
++_LABEL_VALUE = re.compile(r"(?:[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?")
++
++
+ def _host_labels_vm_info(section: Mapping[str, Any]) -> Iterable[HostLabel]:
+     for key, value in section.get("labels", {}).items():
+         if isinstance(value, Mapping):
+@@ -49,7 +53,9 @@ def _host_labels_vm_info(section: Mapping[str, Any]) -> Iterable[HostLabel]:
+         if value is not None:
+             yield HostLabel(f"cmk/kubevirt/label/{key}", str(value))
+     for key, value in section.get("annotations", {}).items():
+-        yield HostLabel(f"cmk/kubevirt/annotation/{key}", str(value))
++        # Defense in depth for older collectors and externally supplied data.
++        if isinstance(value, str) and _LABEL_VALUE.fullmatch(value):
++            yield HostLabel(f"cmk/kubevirt/annotation/{key}", value)
+     if ns := section.get("namespace"):
+         yield HostLabel("cmk/kubevirt/namespace", str(ns))
+     yield HostLabel("cmk/kubevirt/object", "virtualmachine")
+@@ -67,41 +73,108 @@ def _check_vm_info(section: Mapping[str, Any]) -> Iterable[Result]:
+     yield Result(state=State.OK, notice=f"Disks: {len(disks)}, volumes: {len(volumes)}")
+ 
+ 
+-def _check_vm_status(section: Mapping[str, Any]) -> Iterable[Result]:
+-    printable = section.get("printable_status") or section.get("phase") or "unknown"
+-    ready = section.get("ready")
+-    if printable.lower() == "running" and ready is not False:
+-        state = State.OK
+-    elif printable.lower() in {"error", "crashloopbackoff", "failed"}:
+-        state = State.CRIT
+-    elif ready is False:
+-        state = State.WARN
+-    else:
+-        state = State.UNKNOWN
++# KubeVirt printableStatus refers to VM lifecycle, not automatically to health.
++# Unknown/new statuses deliberately remain UNKNOWN so upstream changes are visible.
++_VM_TRANSIENT = {
++    "starting", "provisioning", "migrating", "stopping", "terminating",
++    "scheduling", "waitingforvolumebinding", "pending",
++}
++_VM_FAILED = {
++    "error", "failed", "crashloopbackoff", "errimagepull", "imagepullbackoff",
++    "failedunschedulable", "unschedulable", "datavolumeerror", "failedpvcnotfound", "pvcnotfound",
++}
++# Some transient statuses have no active VMI while a new instance is prepared.
++_VM_NO_RUNTIME = _VM_TRANSIENT | {"stopped", "paused"}
++
++
++def _vm_state(section: Mapping[str, Any], params: Mapping[str, Any]) -> tuple[State, str]:
++    printable = str(section.get("printable_status") or section.get("phase") or "Unknown")
++    normalized = printable.casefold().replace(" ", "")
++    strategy = str(section.get("run_strategy") or "")
++    desired_running = section.get("desired_running")
++    if normalized in _VM_FAILED:
++        return State.CRIT, printable
++    if normalized == "running":
++        return (State.WARN if section.get("ready") is False else State.OK), printable
++    if normalized == "stopped":
++        intentional = strategy.casefold() in {"halted", "manual"} or desired_running is False
++        state_key = "stopped_state" if intentional else "unexpected_stopped_state"
++        return State(params.get(state_key, State.OK.value if intentional else State.CRIT.value)), printable
++    if normalized == "paused":
++        return State(params.get("paused_state", State.WARN.value)), printable
++    if normalized in _VM_TRANSIENT:
++        return State(params.get("transient_state", State.OK.value)), printable
++    return State.UNKNOWN, printable
++
++
++def _check_vm_status(params: Mapping[str, Any], section: Mapping[str, Any]) -> Iterable[Result]:
++    state, printable = _vm_state(section, params)
+     yield Result(state=state, summary=f"Status: {printable}")
+-    if ready is not None:
+-        yield _state_from_bool(ready, "Ready")
++    if section.get("ready") is not None:
++        # A stopped/paused/provisioning VM is naturally not ready. Do not
++        # override the lifecycle-based result with a second CRIT result.
++        ready_state = State.WARN if printable.casefold() == "running" and section["ready"] is False else State.OK
++        yield Result(state=ready_state, notice=f"Ready: {section['ready']}")
+     if section.get("created") is not None:
+-        yield Result(state=State.OK, notice=f"Created: {section.get('created')}")
++        yield Result(state=State.OK, notice=f"Created: {section['created']}")
++    if strategy := section.get("run_strategy"):
++        yield Result(state=State.OK, notice=f"Run strategy: {strategy}")
+     for cond in section.get("conditions", []):
+         ctype = cond.get("type")
+-        status = cond.get("status")
+         if ctype:
+-            yield Result(state=State.OK, notice=f"Condition {ctype}: {status}")
++            yield Result(state=State.OK, notice=f"Condition {ctype}: {cond.get('status')}")
++
+ 
++def _runtime_not_expected(section: Mapping[str, Any] | None) -> bool:
++    if not section:
++        return False
++    printable = str(section.get("printable_status") or "").casefold().replace(" ", "")
++    return printable in _VM_NO_RUNTIME
++
++
++def _discover_vm_placement(
++    section_kubevirt_vm_placement_v1: Mapping[str, Any] | None,
++    section_kubevirt_vm_status_v1: Mapping[str, Any] | None,
++) -> Iterable[Service]:
++    if section_kubevirt_vm_placement_v1 is not None:
++        yield Service()
+ 
+-def _check_vm_placement(section: Mapping[str, Any]) -> Iterable[Result]:
+-    node = section.get("node")
++
++def _check_vm_placement(
++    section_kubevirt_vm_placement_v1: Mapping[str, Any] | None,
++    section_kubevirt_vm_status_v1: Mapping[str, Any] | None,
++) -> Iterable[Result]:
++    if section_kubevirt_vm_placement_v1 is None:
++        return
++    node = section_kubevirt_vm_placement_v1.get("node")
+     if node:
+         yield Result(state=State.OK, summary=f"Node: {node}")
++    elif _runtime_not_expected(section_kubevirt_vm_status_v1):
++        yield Result(state=State.OK, summary="No active node expected in current VM lifecycle state")
+     else:
+         yield Result(state=State.WARN, summary="No node assigned")
+ 
+ 
+-def _check_vm_interfaces(section: Mapping[str, Any]) -> Iterable[Result]:
+-    interfaces = section.get("interfaces") or []
++def _discover_vm_interfaces(
++    section_kubevirt_vm_interfaces_v1: Mapping[str, Any] | None,
++    section_kubevirt_vm_status_v1: Mapping[str, Any] | None,
++) -> Iterable[Service]:
++    if section_kubevirt_vm_interfaces_v1 is not None:
++        yield Service()
++
++
++def _check_vm_interfaces(
++    section_kubevirt_vm_interfaces_v1: Mapping[str, Any] | None,
++    section_kubevirt_vm_status_v1: Mapping[str, Any] | None,
++) -> Iterable[Result]:
++    if section_kubevirt_vm_interfaces_v1 is None:
++        return
++    interfaces = section_kubevirt_vm_interfaces_v1.get("interfaces") or []
+     if not interfaces:
+-        yield Result(state=State.WARN, summary="No interfaces found")
++        if _runtime_not_expected(section_kubevirt_vm_status_v1):
++            yield Result(state=State.OK, summary="No active interfaces expected in current VM lifecycle state")
++        else:
++            yield Result(state=State.WARN, summary="No runtime interfaces found")
+         return
+     yield Result(state=State.OK, summary=f"Interfaces: {len(interfaces)}")
+     for iface in interfaces:
+@@ -124,13 +197,11 @@ def _check_vm_resources(section: Mapping[str, Any]) -> Iterable[Result]:
+ 
+ def _check_vm_cpu(params: Mapping[str, Any], section: Mapping[str, Any]) -> Iterable[Result]:
+     usage = float(section.get("usage", 0.0))
+-    yield Metric("kubevirt_vm_cpu_usage", usage)
+     yield from check_levels(usage, levels_upper=params.get("levels_upper"), metric_name="kubevirt_vm_cpu_usage", label="CPU usage", render_func=lambda v: f"{v:.3f} cores")
+ 
+ 
+ def _check_vm_memory(params: Mapping[str, Any], section: Mapping[str, Any]) -> Iterable[Result]:
+     value = float(section.get("resident_bytes", 0.0))
+-    yield Metric("kubevirt_vm_memory_resident", value)
+     yield from check_levels(value, levels_upper=params.get("levels_upper"), metric_name="kubevirt_vm_memory_resident", label="Resident memory", render_func=render.bytes)
+ 
+ 
+@@ -230,13 +301,13 @@ agent_section_kubevirt_vm_info = AgentSection(name="kubevirt_vm_info_v1", parse_
+ check_plugin_kubevirt_vm_info = CheckPlugin(name="kubevirt_vm_info", service_name="VM info", sections=["kubevirt_vm_info_v1"], discovery_function=_discover_single, check_function=_check_vm_info)
+ 
+ agent_section_kubevirt_vm_status = AgentSection(name="kubevirt_vm_status_v1", parse_function=_parse_json_section)
+-check_plugin_kubevirt_vm_status = CheckPlugin(name="kubevirt_vm_status", service_name="VM status", sections=["kubevirt_vm_status_v1"], discovery_function=_discover_single, check_function=_check_vm_status)
++check_plugin_kubevirt_vm_status = CheckPlugin(name="kubevirt_vm_status", service_name="VM status", sections=["kubevirt_vm_status_v1"], discovery_function=_discover_single, check_function=_check_vm_status, check_default_parameters={}, check_ruleset_name="kubevirt_vm_status")
+ 
+ agent_section_kubevirt_vm_placement = AgentSection(name="kubevirt_vm_placement_v1", parse_function=_parse_json_section)
+-check_plugin_kubevirt_vm_placement = CheckPlugin(name="kubevirt_vm_placement", service_name="VM placement", sections=["kubevirt_vm_placement_v1"], discovery_function=_discover_single, check_function=_check_vm_placement)
++check_plugin_kubevirt_vm_placement = CheckPlugin(name="kubevirt_vm_placement", service_name="VM placement", sections=["kubevirt_vm_placement_v1", "kubevirt_vm_status_v1"], discovery_function=_discover_vm_placement, check_function=_check_vm_placement)
+ 
+ agent_section_kubevirt_vm_interfaces = AgentSection(name="kubevirt_vm_interfaces_v1", parse_function=_parse_json_section)
+-check_plugin_kubevirt_vm_interfaces = CheckPlugin(name="kubevirt_vm_interfaces", service_name="VM interfaces", sections=["kubevirt_vm_interfaces_v1"], discovery_function=_discover_single, check_function=_check_vm_interfaces)
++check_plugin_kubevirt_vm_interfaces = CheckPlugin(name="kubevirt_vm_interfaces", service_name="VM interfaces", sections=["kubevirt_vm_interfaces_v1", "kubevirt_vm_status_v1"], discovery_function=_discover_vm_interfaces, check_function=_check_vm_interfaces)
+ 
+ agent_section_kubevirt_vm_resources = AgentSection(name="kubevirt_vm_resources_v1", parse_function=_parse_json_section)
+ check_plugin_kubevirt_vm_resources = CheckPlugin(name="kubevirt_vm_resources", service_name="VM resources", sections=["kubevirt_vm_resources_v1"], discovery_function=_discover_single, check_function=_check_vm_resources)
+diff --git a/cmk_addons/plugins/kubevirt/libexec/agent_kubevirt b/cmk_addons/plugins/kubevirt/libexec/agent_kubevirt
+old mode 100644
+new mode 100755
+index e873902..3e22578
+--- a/cmk_addons/plugins/kubevirt/libexec/agent_kubevirt
++++ b/cmk_addons/plugins/kubevirt/libexec/agent_kubevirt
+@@ -16,6 +16,7 @@ import json
+ import logging
+ import re
+ import sys
++from urllib.parse import urlsplit
+ from collections import defaultdict
+ from collections.abc import Iterable, Mapping, Sequence
+ from typing import Any
+@@ -27,6 +28,25 @@ from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_sec
+ 
+ LOG = logging.getLogger("agent_kubevirt")
+ 
++# Kubernetes annotation values may contain multiline JSON or secrets. Only
++# label-compatible values are eligible for Checkmk host labels.
++LABEL_VALUE = re.compile(r"(?:[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?")
++
++
++def valid_annotation_value(value: object) -> bool:
++    return isinstance(value, str) and LABEL_VALUE.fullmatch(value) is not None
++
++
++def validate_prometheus_token_transport(endpoint: str, verify_certificate: bool) -> None:
++    """Reject insecure destinations for a separately configured Prometheus credential."""
++    parsed = urlsplit(endpoint)
++    loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
++    if parsed.scheme == "https" and (verify_certificate or loopback):
++        return
++    if parsed.scheme == "http" and loopback:
++        return
++    raise ValueError("Prometheus bearer authentication requires verified HTTPS (or a loopback endpoint)")
++
+ KUBEVIRT_QUERIES = {
+     "cpu": 'sum(rate(kubevirt_vmi_cpu_usage_seconds_total[5m])) by (exported_namespace, name)',
+     "memory": 'sum(kubevirt_vmi_memory_resident_bytes) by (exported_namespace, name)',
+@@ -76,6 +96,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
+     p.add_argument("--include-annotations-as-host-labels", action="store_true")
+     p.add_argument("--include-matching-annotations-as-host-labels")
+     p.add_argument("--prometheus-endpoint")
++    parser_add_secret_option(p, long="--prometheus-token", help="Optional, separate Prometheus bearer token", required=False)
+     p.add_argument("--usage-proxy", default="FROM_ENVIRONMENT")
+     p.add_argument("--usage-verify-cert", action="store_true")
+     p.add_argument("--usage-connect-timeout", type=int, default=10)
+@@ -103,6 +124,12 @@ def _resolve_token(args: argparse.Namespace) -> str:
+     return resolve_secret_option(args, "token").reveal()
+ 
+ 
++def _resolve_prometheus_token(args: argparse.Namespace) -> str | None:
++    if not (getattr(args, "prometheus_token", None) or getattr(args, "prometheus_token_id", None)):
++        return None
++    return resolve_secret_option(args, "prometheus_token").reveal()
++
++
+ def _proxy(value: str) -> Mapping[str, str] | None:
+     if value == "FROM_ENVIRONMENT":
+         return None
+@@ -112,7 +139,11 @@ def _proxy(value: str) -> Mapping[str, str] | None:
+ 
+ 
+ def _get_json(session: requests.Session, url: str, **kwargs: Any) -> Mapping[str, Any]:
+-    response = session.get(url, **kwargs)
++    # Reject redirects rather than forwarding credentials or silently moving to
++    # a different endpoint.
++    response = session.get(url, allow_redirects=False, **kwargs)
++    if 300 <= response.status_code < 400:
++        raise RuntimeError(f"HTTP redirect refused for monitoring endpoint: {url}")
+     response.raise_for_status()
+     data = response.json()
+     if not isinstance(data, Mapping):
+@@ -159,10 +190,10 @@ def _vm_section_data(vm: Mapping[str, Any], vmi: Mapping[str, Any] | None, clust
+ 
+     raw_annotations = meta.get("annotations") or {}
+     if import_annotations:
+-        annotations = raw_annotations
++        annotations = {k: v for k, v in raw_annotations.items() if valid_annotation_value(v)}
+     elif annotation_pattern:
+         regex = re.compile(annotation_pattern)
+-        annotations = {k: v for k, v in raw_annotations.items() if regex.search(k)}
++        annotations = {k: v for k, v in raw_annotations.items() if regex.search(k) and valid_annotation_value(v)}
+     else:
+         annotations = {}
+ 
+@@ -194,6 +225,8 @@ def _vm_section_data(vm: Mapping[str, Any], vmi: Mapping[str, Any] | None, clust
+         },
+         "kubevirt_vm_status_v1": {
+             "printable_status": status.get("printableStatus"),
++            "run_strategy": spec.get("runStrategy"),
++            "desired_running": spec.get("running"),
+             "ready": status.get("ready"),
+             "created": status.get("created"),
+             "phase": vmi_status.get("phase"),
+@@ -271,9 +304,11 @@ def _vm_key(metric: Mapping[str, Any]) -> tuple[str, str]:
+     return (str(metric.get("exported_namespace") or metric.get("namespace") or "default"), str(metric.get("name") or metric.get("domain") or metric.get("vm") or "unknown"))
+ 
+ 
+-def collect_prometheus(args: argparse.Namespace, token: str) -> None:
++def collect_prometheus(args: argparse.Namespace, prometheus_token: str | None = None) -> None:
+     if not args.prometheus_endpoint:
+         return
++    if prometheus_token:
++        validate_prometheus_token_transport(args.prometheus_endpoint, args.usage_verify_cert)
+     if not args.usage_verify_cert:
+         LOG.warning("Disabling SSL certificate verification for Prometheus endpoint.")
+     kwargs = {
+@@ -282,7 +317,8 @@ def collect_prometheus(args: argparse.Namespace, token: str) -> None:
+         "proxies": _proxy(args.usage_proxy),
+     }
+     with requests.Session() as session:
+-        session.headers.update({"Authorization": f"Bearer {token}"})
++        if prometheus_token:
++            session.headers.update({"Authorization": f"Bearer {prometheus_token}"})
+         results = {name: prom_query(session, args.prometheus_endpoint, query, **kwargs) for name, query in KUBEVIRT_QUERIES.items()}
+ 
+     per_vm: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"net": defaultdict(dict), "disk": defaultdict(dict)})
+@@ -342,13 +378,16 @@ def main(argv: list[str] | None = None) -> int:
+         argv = sys.argv[1:]
+     args = parse_args(argv)
+     setup_logging(args.verbose)
+-    LOG.debug("parsed arguments: %r", args)
++    # Never log argparse's Namespace here: it may include explicit bearer tokens.
+     if not args.verify_cert_api or (args.prometheus_endpoint and not args.usage_verify_cert):
+         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+     try:
+         token = _resolve_token(args)
++        prometheus_token = _resolve_prometheus_token(args)
++        if prometheus_token and args.prometheus_endpoint:
++            validate_prometheus_token_transport(args.prometheus_endpoint, args.usage_verify_cert)
+         collect_api(args, token)
+-        collect_prometheus(args, token)
++        collect_prometheus(args, prometheus_token)
+     except Exception as exc:
+         if args.debug:
+             raise
+diff --git a/cmk_addons/plugins/kubevirt/rulesets/kubevirt_vm_cpu.py b/cmk_addons/plugins/kubevirt/rulesets/kubevirt_vm_cpu.py
+new file mode 100644
+index 0000000..f4bc114
+--- /dev/null
++++ b/cmk_addons/plugins/kubevirt/rulesets/kubevirt_vm_cpu.py
+@@ -0,0 +1,27 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (C) 2026 Sudhir Chauhan
++
++from cmk.rulesets.v1 import Title, Help
++from cmk.rulesets.v1.form_specs import (
++    DataSize, DefaultValue, DictElement, Dictionary, Float,
++    IECMagnitude, LevelDirection, ServiceState, SimpleLevels,
++)
++from cmk.rulesets.v1.rule_specs import CheckParameters, HostCondition, Topic
++
++def _parameter_form():
++    return Dictionary(elements={
++        "levels_upper": DictElement(required=False, parameter_form=SimpleLevels(
++            title=Title("VM CPU usage (CPU cores)"),
++            help_text=Help("Upper limits for the observed CPU usage in cores. 1.0 means one full CPU core, not 1 percent."),
++            form_spec_template=Float(unit_symbol="cores"),
++            level_direction=LevelDirection.UPPER,
++            prefill_fixed_levels=DefaultValue((1.5, 1.9)),
++        )),
++    })
++
++
++rule_spec_kubevirt_vm_cpu = CheckParameters(
++    name="kubevirt_vm_cpu", title=Title("KubeVirt VM CPU usage"),
++    topic=Topic.VIRTUALIZATION, parameter_form=_parameter_form,
++    condition=HostCondition(),
++)
+diff --git a/cmk_addons/plugins/kubevirt/rulesets/kubevirt_vm_memory.py b/cmk_addons/plugins/kubevirt/rulesets/kubevirt_vm_memory.py
+new file mode 100644
+index 0000000..5f1b6b8
+--- /dev/null
++++ b/cmk_addons/plugins/kubevirt/rulesets/kubevirt_vm_memory.py
+@@ -0,0 +1,27 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (C) 2026 Sudhir Chauhan
++
++from cmk.rulesets.v1 import Title, Help
++from cmk.rulesets.v1.form_specs import (
++    DataSize, DefaultValue, DictElement, Dictionary, Float,
++    IECMagnitude, LevelDirection, ServiceState, SimpleLevels,
++)
++from cmk.rulesets.v1.rule_specs import CheckParameters, HostCondition, Topic
++
++def _parameter_form():
++    return Dictionary(elements={
++        "levels_upper": DictElement(required=False, parameter_form=SimpleLevels(
++            title=Title("VM resident memory"),
++            help_text=Help("Upper thresholds for resident VM memory in bytes. These are absolute values, not percentages of guest allocated memory."),
++            form_spec_template=DataSize(displayed_magnitudes=[IECMagnitude.MEBI, IECMagnitude.GIBI, IECMagnitude.TEBI]),
++            level_direction=LevelDirection.UPPER,
++            prefill_fixed_levels=DefaultValue((2 * 1024**3, 3 * 1024**3)),
++        )),
++    })
++
++
++rule_spec_kubevirt_vm_memory = CheckParameters(
++    name="kubevirt_vm_memory", title=Title("KubeVirt VM resident memory"),
++    topic=Topic.VIRTUALIZATION, parameter_form=_parameter_form,
++    condition=HostCondition(),
++)
+diff --git a/cmk_addons/plugins/kubevirt/rulesets/kubevirt_vm_status.py b/cmk_addons/plugins/kubevirt/rulesets/kubevirt_vm_status.py
+new file mode 100644
+index 0000000..1df4b14
+--- /dev/null
++++ b/cmk_addons/plugins/kubevirt/rulesets/kubevirt_vm_status.py
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (C) 2026 Sudhir Chauhan
++
++from cmk.rulesets.v1 import Title, Help
++from cmk.rulesets.v1.form_specs import (
++    DataSize, DefaultValue, DictElement, Dictionary, Float,
++    IECMagnitude, LevelDirection, ServiceState, SimpleLevels,
++)
++from cmk.rulesets.v1.rule_specs import CheckParameters, HostCondition, Topic
++
++def _parameter_form():
++    return Dictionary(elements={
++        "stopped_state": DictElement(required=False, parameter_form=ServiceState(
++            title=Title("State for intentionally stopped VMs"),
++            prefill=DefaultValue(0),
++        )),
++        "unexpected_stopped_state": DictElement(required=False, parameter_form=ServiceState(
++            title=Title("State for unexpectedly stopped VMs"),
++            prefill=DefaultValue(2),
++        )),
++        "paused_state": DictElement(required=False, parameter_form=ServiceState(
++            title=Title("State for paused VMs"),
++            prefill=DefaultValue(1),
++        )),
++        "transient_state": DictElement(required=False, parameter_form=ServiceState(
++            title=Title("State for normal transitional VM statuses"),
++            help_text=Help("For Starting, Provisioning, Migrating, Stopping, and similar states. No time-based escalation is applied unless status durations become reliably available."),
++            prefill=DefaultValue(0),
++        )),
++    })
++
++
++rule_spec_kubevirt_vm_status = CheckParameters(
++    name="kubevirt_vm_status", title=Title("KubeVirt VM lifecycle status"),
++    topic=Topic.VIRTUALIZATION, parameter_form=_parameter_form,
++    condition=HostCondition(),
++)
+diff --git a/cmk_addons/plugins/kubevirt/rulesets/special_agent.py b/cmk_addons/plugins/kubevirt/rulesets/special_agent.py
+index f8b3ce7..4616fd8 100644
+--- a/cmk_addons/plugins/kubevirt/rulesets/special_agent.py
++++ b/cmk_addons/plugins/kubevirt/rulesets/special_agent.py
+@@ -44,16 +44,26 @@ def _timeout_form() -> Dictionary:
+     )
+ 
+ 
+-def _endpoint_form(title: str, help_text: str, hint: str) -> Dictionary:
++def _endpoint_form(title: str, help_text: str, hint: str, *, optional_auth: bool = False) -> Dictionary:
++    elements = {
++        "endpoint_v2": DictElement(required=True, parameter_form=String(title=Title("Endpoint"), prefill=InputHint(hint), custom_validate=(validators.LengthInRange(min_value=1),), help_text=Help(help_text))),
++        "verify_cert": DictElement(required=True, parameter_form=BooleanChoice(title=Title("SSL certificate verification"), label=Label("Verify certificate"), prefill=DefaultValue(True))),
++        "proxy": DictElement(required=False, parameter_form=String(title=Title("Proxy"), help_text=Help("Use FROM_ENVIRONMENT, NO_PROXY, or a proxy URL."), prefill=InputHint("FROM_ENVIRONMENT"))),
++        "timeout": DictElement(required=False, parameter_form=_timeout_form()),
++    }
++    if optional_auth:
++        elements["token"] = DictElement(
++            required=False,
++            parameter_form=Password(
++                title=Title("Prometheus bearer token (optional)"),
++                help_text=Help("Separate Prometheus credential. The Kubernetes API token is never sent to Prometheus automatically. Use HTTPS for remote endpoints."),
++                migrate=migrate_to_password,
++            ),
++        )
+     return Dictionary(
+         title=Title(title),
+         migrate=_migrate_dict,
+-        elements={
+-            "endpoint_v2": DictElement(required=True, parameter_form=String(title=Title("Endpoint"), prefill=InputHint(hint), custom_validate=(validators.LengthInRange(min_value=1),), help_text=Help(help_text))),
+-            "verify_cert": DictElement(required=True, parameter_form=BooleanChoice(title=Title("SSL certificate verification"), label=Label("Verify certificate"), prefill=DefaultValue(True))),
+-            "proxy": DictElement(required=False, parameter_form=String(title=Title("Proxy"), help_text=Help("Use FROM_ENVIRONMENT, NO_PROXY, or a proxy URL."), prefill=InputHint("FROM_ENVIRONMENT"))),
+-            "timeout": DictElement(required=False, parameter_form=_timeout_form()),
+-        },
++        elements=elements,
+     )
+ 
+ 
+@@ -87,7 +97,7 @@ def _parameter_form() -> Dictionary:
+             "cluster_name": DictElement(required=True, parameter_form=String(title=Title("Cluster name"), custom_validate=(validators.LengthInRange(min_value=1),), help_text=Help("Used to make VM piggyback host names unique."))),
+             "token": DictElement(required=True, parameter_form=Password(title=Title("Bearer token"), custom_validate=(validators.LengthInRange(min_value=1),), migrate=migrate_to_password)),
+             "kubernetes_api_server": DictElement(required=True, parameter_form=_endpoint_form("Kubernetes API server", "Endpoint used to query KubeVirt VirtualMachine and VirtualMachineInstance resources.", "https://api.example:6443")),
+-            "prometheus": DictElement(required=False, parameter_form=_endpoint_form("Prometheus endpoint", "Prometheus base URL used for kubevirt_* metrics. Do not append /api/v1/query.", "https://prometheus.example:9090")),
++            "prometheus": DictElement(required=False, parameter_form=_endpoint_form("Prometheus endpoint", "Prometheus base URL used for kubevirt_* metrics. Do not append /api/v1/query.", "https://prometheus.example:9090", optional_auth=True)),
+             "namespaces": DictElement(required=False, parameter_form=CascadingSingleChoice(
+                 title=Title("Namespaces"), migrate=_migrate_namespaces,
+                 elements=[
+diff --git a/cmk_addons/plugins/kubevirt/server_side_calls/special_agent.py b/cmk_addons/plugins/kubevirt/server_side_calls/special_agent.py
+index 1945e90..3fcc0a7 100644
+--- a/cmk_addons/plugins/kubevirt/server_side_calls/special_agent.py
++++ b/cmk_addons/plugins/kubevirt/server_side_calls/special_agent.py
+@@ -59,6 +59,8 @@ def _agent_arguments(params: dict[str, Any], host_config: HostConfig) -> Iterabl
+     if prom := params.get("prometheus"):
+         prom = _endpoint_value(prom)
+         args.extend(["--prometheus-endpoint", str(prom["endpoint_v2"])])
++        if prom.get("token") is not None:
++            args.extend(["--prometheus-token-id", prom["token"]])
+         if prom.get("verify_cert"):
+             args.append("--usage-verify-cert")
+         if proxy := prom.get("proxy"):
+diff --git a/manifest.json b/manifest.json
+index 7c88223..52e7bd6 100644
+--- a/manifest.json
++++ b/manifest.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "kubevirt",
+   "title": "KubeVirt special agent",
+-  "version": "0.1.0",
++  "version": "0.1.1",
+   "version.min_required": "2.5.0",
+   "version.usable_until": null,
+   "version.packaged": "manual",
+diff --git a/tests/test_kubevirt_regressions.py b/tests/test_kubevirt_regressions.py
+new file mode 100644
+index 0000000..387ffd2
+--- /dev/null
++++ b/tests/test_kubevirt_regressions.py
+@@ -0,0 +1,176 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (C) 2026 Sudhir Chauhan
++
++"""Isolated regressions that run without a Checkmk site or live KubeVirt cluster."""
++
++from __future__ import annotations
++
++import importlib.util
++import runpy
++import sys
++import types
++from enum import IntEnum
++from pathlib import Path
++from unittest.mock import Mock, patch
++
++import pytest
++import requests
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++@pytest.fixture
++def special_agent(monkeypatch):
++    cmk = types.ModuleType("cmk")
++    cmk.__path__ = []
++    password = types.ModuleType("cmk.password_store")
++    password.__path__ = []
++    api = types.ModuleType("cmk.password_store.v1_unstable")
++    api.parser_add_secret_option = lambda parser, long, help, required: (
++        parser.add_argument(long), parser.add_argument(long + "-id")
++    )
++    api.resolve_secret_option = lambda args, name: types.SimpleNamespace(
++        reveal=lambda: getattr(args, name, None) or "secret-from-password-store"
++    )
++    for name, module in [("cmk", cmk), ("cmk.password_store", password), ("cmk.password_store.v1_unstable", api)]:
++        monkeypatch.setitem(sys.modules, name, module)
++    path = ROOT / "cmk_addons/plugins/kubevirt/libexec/agent_kubevirt"
++    namespace = runpy.run_path(str(path), run_name="agent_test")
++    return types.SimpleNamespace(**namespace)
++
++
++@pytest.fixture
++def checks(monkeypatch):
++    class State(IntEnum):
++        OK = 0
++        WARN = 1
++        CRIT = 2
++        UNKNOWN = 3
++
++    class Result:
++        def __init__(self, state, summary=None, notice=None):
++            self.state, self.summary, self.notice = state, summary, notice
++
++    class Service:
++        def __init__(self, item=None):
++            self.item = item
++
++    class HostLabel:
++        def __init__(self, name, value):
++            self.name, self.value = name, value
++
++    class Metric:
++        def __init__(self, name, value, **kwargs):
++            self.name, self.value = name, value
++
++    class Plugin:
++        def __init__(self, **kwargs):
++            self.__dict__.update(kwargs)
++
++    agent_base = types.ModuleType("cmk.agent_based")
++    agent_base.__path__ = []
++    v2 = types.ModuleType("cmk.agent_based.v2")
++    for name, item in {"State": State, "Result": Result, "Service": Service, "Metric": Metric,
++                       "HostLabel": HostLabel, "AgentSection": Plugin, "CheckPlugin": Plugin}.items():
++        setattr(v2, name, item)
++    v2.render = types.SimpleNamespace(bytes=lambda n: f"{n} bytes", networkbandwidth=str, disksize=str)
++    v2.check_levels = lambda value, **kwargs: iter([Result(State.OK, summary=f"{value}"), Metric(kwargs.get("metric_name"), value)])
++    cmk = types.ModuleType("cmk")
++    cmk.__path__ = []
++    for name, mod in [("cmk", cmk), ("cmk.agent_based", agent_base), ("cmk.agent_based.v2", v2)]:
++        monkeypatch.setitem(sys.modules, name, mod)
++    path = ROOT / "cmk_addons/plugins/kubevirt/agent_based/kubevirt.py"
++    spec = importlib.util.spec_from_file_location("kubevirt_checks_test", path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def test_reject_large_and_multiline_annotations(special_agent, checks):
++    assert special_agent.valid_annotation_value("version_1")
++    assert special_agent.valid_annotation_value("")
++    assert not special_agent.valid_annotation_value("{\"secret\": \"value\"}")
++    assert not special_agent.valid_annotation_value("first\nsecond")
++    assert not special_agent.valid_annotation_value("x" * 64)
++    vm = {"metadata": {"name": "testvm", "namespace": "default", "annotations": {
++        "allowed": "v1", "last-applied": "{\"foo\":true}\n", "long": "z" * 64}}, "spec": {}, "status": {}}
++    sections = special_agent._vm_section_data(vm, None, "cluster", "source", True, None)
++    assert sections["kubevirt_vm_info_v1"]["annotations"] == {"allowed": "v1"}
++    labels = list(checks._host_labels_vm_info({"annotations": {"bad": "x\ny", "valid": "hello"}}))
++    assert all(label.name != "cmk/kubevirt/annotation/bad" for label in labels)
++    assert any(label.value == "hello" for label in labels)
++
++
++def test_prometheus_not_given_kubernetes_token(special_agent):
++    args = types.SimpleNamespace(prometheus_endpoint="https://prometheus.example", usage_verify_cert=True,
++                                 usage_proxy="NO_PROXY", usage_connect_timeout=1, usage_read_timeout=1)
++    session = Mock()
++    session.__enter__ = Mock(return_value=session)
++    session.__exit__ = Mock(return_value=False)
++    session.get.return_value = types.SimpleNamespace(
++        status_code=200, raise_for_status=lambda: None,
++        json=lambda: {"status": "success", "data": {"result": []}},
++    )
++    with patch.object(special_agent.requests, "Session", return_value=session):
++        with patch.object(special_agent, "KUBEVIRT_QUERIES", {"cpu": "up", "memory": "up",
++                    "net_rx": "up", "net_tx": "up", "disk_read": "up", "disk_write": "up",
++                    "version": "up", "component_up": "up", "controller_leading": "up",
++                    "controller_ready": "up", "operator_leading": "up", "operator_ready": "up",
++                    "workqueue_depth": "up", "workqueue_adds": "up", "workqueue_retries": "up",
++                    "workqueue_unfinished": "up", "migrations_pending": "up", "migrations_running": "up",
++                    "migrations_scheduling": "up", "migrations_unset": "up", "vmi_phase_count": "up",
++                    "vm_running": "up", "vm_starting": "up", "vm_non_running": "up",
++                    "vm_migrating": "up", "vm_error": "up"}):
++            special_agent.collect_prometheus(args)  # public endpoint: no authentication
++    assert "Authorization" not in session.headers.update.call_args_list.__str__()
++    assert session.get.call_args.kwargs["allow_redirects"] is False
++
++
++@pytest.mark.parametrize("url,verify,allowed", [
++    ("http://evil.example", True, False), ("https://evil.example", False, False),
++    ("https://prometheus.example", True, True), ("http://127.0.0.1:9090", False, True),
++])
++def test_prometheus_token_transport(special_agent, url, verify, allowed):
++    if allowed:
++        special_agent.validate_prometheus_token_transport(url, verify)
++    else:
++        with pytest.raises(ValueError):
++            special_agent.validate_prometheus_token_transport(url, verify)
++
++
++def test_reject_redirect(special_agent):
++    session = Mock()
++    session.get.return_value.status_code = 302
++    with pytest.raises(RuntimeError, match="redirect refused"):
++        special_agent._get_json(session, "https://prometheus.example/api/v1/query")
++    assert session.get.call_args.kwargs["allow_redirects"] is False
++
++
++@pytest.mark.parametrize("status,run_strategy,expected", [
++    ("Running", "Always", 0), ("Stopped", "Halted", 0),
++    ("Stopped", "Always", 2), ("Starting", "Always", 0),
++    ("Provisioning", "Always", 0), ("Migrating", "Always", 0),
++    ("Paused", "Always", 1), ("DataVolumeError", "Always", 2),
++    ("ErrImagePull", "Always", 2), ("FailedUnschedulable", "Always", 2),
++    ("PVCNotFound", "Always", 2), ("NewUpstreamState", "Always", 3),
++])
++def test_lifecycle_mapping(checks, status, run_strategy, expected):
++    state, _ = checks._vm_state({"printable_status": status, "run_strategy": run_strategy}, {})
++    assert state.value == expected
++
++
++def test_stopped_vm_has_normal_placement_and_interfaces(checks):
++    stopped = {"printable_status": "Stopped", "run_strategy": "Halted", "ready": False}
++    placement = list(checks._check_vm_placement({"node": None}, stopped))
++    interfaces = list(checks._check_vm_interfaces({"interfaces": []}, stopped))
++    assert placement[0].state == checks.State.OK
++    assert interfaces[0].state == checks.State.OK
++    assert list(checks._check_vm_placement({"node": None}, {"printable_status": "Running"}))[0].state == checks.State.WARN
++
++
++def test_status_rules_wired(checks):
++    assert checks.check_plugin_kubevirt_vm_status.check_ruleset_name == "kubevirt_vm_status"
++    assert checks.check_plugin_kubevirt_vm_memory.check_ruleset_name == "kubevirt_vm_memory"
++    assert checks.check_plugin_kubevirt_vm_cpu.check_ruleset_name == "kubevirt_vm_cpu"
++    assert list(checks._check_vm_status({}, {"printable_status": "Stopped", "ready": False,
++                                          "run_strategy": "Halted"}))[0].state == checks.State.OK
+diff --git a/tools/build_mkp.py b/tools/build_mkp.py
+old mode 100644
+new mode 100755
+index 13f02ae..16a05f3
+--- a/tools/build_mkp.py
++++ b/tools/build_mkp.py
+@@ -38,6 +38,7 @@ def build() -> Path:
+         "description": manifest.get("description", ""),
+         "download_url": manifest.get("download_url", ""),
+         "files": files,
++        "license": manifest.get("license", "GPL-2.0-only"),
+         "name": name,
+         "title": manifest["title"],
+         "version": version,

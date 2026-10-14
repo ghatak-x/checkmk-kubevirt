@@ -38,6 +38,7 @@ def build() -> Path:
         "description": manifest.get("description", ""),
         "download_url": manifest.get("download_url", ""),
         "files": files,
+        "license": manifest.get("license", "GPL-2.0-only"),
         "name": name,
         "title": manifest["title"],
         "version": version,

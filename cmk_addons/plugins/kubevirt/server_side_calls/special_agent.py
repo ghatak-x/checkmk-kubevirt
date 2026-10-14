@@ -59,6 +59,8 @@ def _agent_arguments(params: dict[str, Any], host_config: HostConfig) -> Iterabl
     if prom := params.get("prometheus"):
         prom = _endpoint_value(prom)
         args.extend(["--prometheus-endpoint", str(prom["endpoint_v2"])])
+        if prom.get("token") is not None:
+            args.extend(["--prometheus-token-id", prom["token"]])
         if prom.get("verify_cert"):
             args.append("--usage-verify-cert")
         if proxy := prom.get("proxy"):

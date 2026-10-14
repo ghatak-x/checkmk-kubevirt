@@ -37,7 +37,7 @@ Build the MKP locally or download it from a GitHub release / Checkmk Exchange pa
 
 ```bash
 python tools/build_mkp.py
-mkp add dist/kubevirt-0.1.0.mkp
+mkp add dist/kubevirt-0.1.1.mkp
 mkp enable kubevirt 0.1.0
 cmk -R
 ```
@@ -85,3 +85,21 @@ python tools/build_mkp.py
 ## License
 
 GPL-2.0-only. See `LICENSE`.
+
+## Monitoring policies and authentication (v0.1.1)
+
+The VM CPU, VM resident memory, and VM lifecycle status checks now support
+**Setup → Services → Service monitoring rules**. CPU values are measured in
+CPU cores, and resident memory is measured in bytes.
+
+Prometheus runs without authentication by default, independently from the
+Kubernetes API token. If Prometheus requires a bearer token, configure a
+**separate Prometheus bearer token** in the special-agent rule. Authenticated
+remote Prometheus requests require TLS certificate verification; for lab
+port-forwards a localhost endpoint is also supported. HTTP redirects are
+rejected. Existing Prometheus endpoints previously relying on implicit reuse of
+the Kubernetes token must be configured with their own token after upgrading.
+
+VMs deliberately stopped or in normal transitional lifecycle states no longer
+trigger false placement/interface warnings. Status handling defaults are
+configurable; unknown new status values remain UNKNOWN.
