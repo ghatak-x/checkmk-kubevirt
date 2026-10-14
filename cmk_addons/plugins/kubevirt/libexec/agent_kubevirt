@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Sudhir Chauhan
+
+"""Independent Checkmk special agent for KubeVirt.
+
+This agent intentionally talks only to the KubeVirt API resources and to a
+Prometheus endpoint containing KubeVirt metrics. It does not import or call
+agent_kube and does not collect generic Kubernetes pods/nodes/deployments.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+from collections import defaultdict
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
+
+import requests
+import urllib3
+
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
+
+LOG = logging.getLogger("agent_kubevirt")
+
+KUBEVIRT_QUERIES = {
+    "cpu": 'sum(rate(kubevirt_vmi_cpu_usage_seconds_total[5m])) by (exported_namespace, name)',
+    "memory": 'sum(kubevirt_vmi_memory_resident_bytes) by (exported_namespace, name)',
+    "net_rx": 'sum(rate(kubevirt_vmi_network_receive_bytes_total[5m])) by (exported_namespace, name, interface)',
+    "net_tx": 'sum(rate(kubevirt_vmi_network_transmit_bytes_total[5m])) by (exported_namespace, name, interface)',
+    "disk_read": 'sum(rate(kubevirt_vmi_storage_read_traffic_bytes_total[5m])) by (exported_namespace, name, drive)',
+    "disk_write": 'sum(rate(kubevirt_vmi_storage_write_traffic_bytes_total[5m])) by (exported_namespace, name, drive)',
+    "version": 'kubevirt_info',
+    "component_up": 'up{job=~".*kubevirt.*|kubevirt.*"}',
+    "controller_leading": 'max(kubevirt_virt_controller_leading_status)',
+    "controller_ready": 'max(kubevirt_virt_controller_ready_status)',
+    "operator_leading": 'max(kubevirt_virt_operator_leading_status)',
+    "operator_ready": 'max(kubevirt_virt_operator_ready_status)',
+    "workqueue_depth": 'sum(kubevirt_workqueue_depth) by (name, queue, workqueue)',
+    "workqueue_adds": 'sum(rate(kubevirt_workqueue_adds_total[5m])) by (name, queue, workqueue)',
+    "workqueue_retries": 'sum(rate(kubevirt_workqueue_retries_total[5m])) by (name, queue, workqueue)',
+    "workqueue_unfinished": 'sum(kubevirt_workqueue_unfinished_work_seconds) by (name, queue, workqueue)',
+    # Current upstream names in the lab output:
+    "migrations_pending": 'sum(kubevirt_vmi_migrations_in_pending_phase)',
+    "migrations_running": 'sum(kubevirt_vmi_migrations_in_running_phase)',
+    "migrations_scheduling": 'sum(kubevirt_vmi_migrations_in_scheduling_phase)',
+    "migrations_unset": 'sum(kubevirt_vmi_migrations_in_unset_phase)',
+    "vmi_phase_count": 'sum(kubevirt_vmi_phase_count) by (phase)',
+    "vm_running": 'kubevirt_vm_running_status_last_transition_timestamp_seconds',
+    "vm_starting": 'kubevirt_vm_starting_status_last_transition_timestamp_seconds',
+    "vm_non_running": 'kubevirt_vm_non_running_status_last_transition_timestamp_seconds',
+    "vm_migrating": 'kubevirt_vm_migrating_status_last_transition_timestamp_seconds',
+    "vm_error": 'kubevirt_vm_error_status_last_transition_timestamp_seconds',
+}
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Monitor KubeVirt virtual machines and KubeVirt platform metrics")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument("--cluster", required=True)
+    p.add_argument("--kubernetes-cluster-hostname", required=True)
+    parser_add_secret_option(p, long="--token", help="Kubernetes bearer token", required=True)
+    p.add_argument("--api-server-endpoint", required=True)
+    p.add_argument("--api-server-proxy", default="FROM_ENVIRONMENT")
+    p.add_argument("--verify-cert-api", action="store_true")
+    p.add_argument("--k8s-api-connect-timeout", type=int, default=10)
+    p.add_argument("--k8s-api-read-timeout", type=int, default=12)
+    ns = p.add_mutually_exclusive_group()
+    ns.add_argument("--namespace-include-patterns", "-n", action="append", default=[])
+    ns.add_argument("--namespace-exclude-patterns", action="append", default=[])
+    p.add_argument("--include-annotations-as-host-labels", action="store_true")
+    p.add_argument("--include-matching-annotations-as-host-labels")
+    p.add_argument("--prometheus-endpoint")
+    p.add_argument("--usage-proxy", default="FROM_ENVIRONMENT")
+    p.add_argument("--usage-verify-cert", action="store_true")
+    p.add_argument("--usage-connect-timeout", type=int, default=10)
+    p.add_argument("--usage-read-timeout", type=int, default=12)
+    return p.parse_args(argv)
+
+
+def setup_logging(verbosity: int) -> None:
+    if verbosity >= 3:
+        level = logging.DEBUG
+    elif verbosity == 2:
+        level = logging.INFO
+    elif verbosity == 1:
+        level = logging.WARNING
+    else:
+        logging.disable(logging.CRITICAL)
+        level = logging.CRITICAL
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def _resolve_token(args: argparse.Namespace) -> str:
+    # parser_add_secret_option creates both --token and --token-id.
+    # resolve_secret_option always returns a Secret wrapper; reveal() is needed
+    # before using it in the Authorization header.
+    return resolve_secret_option(args, "token").reveal()
+
+
+def _proxy(value: str) -> Mapping[str, str] | None:
+    if value == "FROM_ENVIRONMENT":
+        return None
+    if value == "NO_PROXY":
+        return {"http": "", "https": ""}
+    return {"http": value, "https": value}
+
+
+def _get_json(session: requests.Session, url: str, **kwargs: Any) -> Mapping[str, Any]:
+    response = session.get(url, **kwargs)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, Mapping):
+        raise RuntimeError(f"Unexpected JSON payload from {url}")
+    return data
+
+
+def _list_items(session: requests.Session, endpoint: str, path: str, **kwargs: Any) -> list[Mapping[str, Any]]:
+    data = _get_json(session, endpoint.rstrip("/") + path, **kwargs)
+    return [item for item in data.get("items", []) if isinstance(item, Mapping)]
+
+
+def _volume_source(volume: Mapping[str, Any]) -> str | None:
+    for key in volume.keys():
+        if key != "name":
+            return str(key)
+    return None
+
+
+def _parse_quantity(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value)
+    units = [("Ki", 1024), ("Mi", 1024**2), ("Gi", 1024**3), ("Ti", 1024**4), ("m", 0.001)]
+    for suffix, factor in units:
+        if s.endswith(suffix):
+            return float(s[:-len(suffix)]) * factor
+    return float(s)
+
+
+def _vm_section_data(vm: Mapping[str, Any], vmi: Mapping[str, Any] | None, cluster: str, host: str, import_annotations: bool, annotation_pattern: str | None) -> dict[str, Mapping[str, Any]]:
+    meta = vm.get("metadata", {}) or {}
+    spec = vm.get("spec", {}) or {}
+    status = vm.get("status", {}) or {}
+    template_spec = ((spec.get("template") or {}).get("spec") or {})
+    domain = template_spec.get("domain") or {}
+    devices = domain.get("devices") or {}
+    resources = domain.get("resources") or {}
+    requests = resources.get("requests") or {}
+    cpu = domain.get("cpu") or {}
+    vmi_status = (vmi or {}).get("status", {}) or {}
+
+    raw_annotations = meta.get("annotations") or {}
+    if import_annotations:
+        annotations = raw_annotations
+    elif annotation_pattern:
+        regex = re.compile(annotation_pattern)
+        annotations = {k: v for k, v in raw_annotations.items() if regex.search(k)}
+    else:
+        annotations = {}
+
+    disks = []
+    for disk in devices.get("disks", []) or []:
+        if isinstance(disk, Mapping):
+            disks.append({"name": disk.get("name"), "bus": (disk.get("disk") or {}).get("bus") or disk.get("bus")})
+    volumes = []
+    for volume in template_spec.get("volumes", []) or []:
+        if isinstance(volume, Mapping):
+            volumes.append({"name": volume.get("name"), "source": _volume_source(volume)})
+    interfaces = []
+    for iface in vmi_status.get("interfaces", []) or []:
+        if isinstance(iface, Mapping):
+            interfaces.append({"name": iface.get("name"), "ip_address": iface.get("ipAddress"), "mac": iface.get("mac"), "info_source": iface.get("infoSource")})
+
+    return {
+        "kubevirt_vm_info_v1": {
+            "namespace": meta.get("namespace"),
+            "name": meta.get("name"),
+            "uid": meta.get("uid"),
+            "labels": meta.get("labels") or {},
+            "annotations": annotations,
+            "cluster": cluster,
+            "kubernetes_cluster_hostname": host,
+            "run_strategy": spec.get("runStrategy"),
+            "disks": disks,
+            "volumes": volumes,
+        },
+        "kubevirt_vm_status_v1": {
+            "printable_status": status.get("printableStatus"),
+            "ready": status.get("ready"),
+            "created": status.get("created"),
+            "phase": vmi_status.get("phase"),
+            "conditions": status.get("conditions") or [],
+        },
+        "kubevirt_vm_placement_v1": {"node": vmi_status.get("nodeName")},
+        "kubevirt_vm_interfaces_v1": {"interfaces": interfaces},
+        "kubevirt_vm_resources_v1": {"cpu_cores": _parse_quantity(cpu.get("cores")), "memory_request": _parse_quantity(requests.get("memory"))},
+    }
+
+
+def _write_pb(piggyback: str, sections: Mapping[str, Mapping[str, Any]]) -> None:
+    sys.stdout.write(f"<<<<{piggyback}>>>>\n")
+    for section_name, data in sections.items():
+        sys.stdout.write(f"<<<{section_name}:sep(0)>>>\n")
+        sys.stdout.write(json.dumps(data, separators=(",", ":")) + "\n")
+    sys.stdout.write("<<<<>>>>\n")
+
+
+def _monitor_namespace(name: str, include: Sequence[str], exclude: Sequence[str]) -> bool:
+    if include:
+        return any(re.search(pattern, name) for pattern in include)
+    if exclude:
+        return not any(re.search(pattern, name) for pattern in exclude)
+    return True
+
+
+def collect_api(args: argparse.Namespace, token: str) -> None:
+    if not args.verify_cert_api:
+        LOG.warning("Disabling SSL certificate verification for Kubernetes API endpoint.")
+    kwargs = {
+        "verify": args.verify_cert_api,
+        "timeout": (args.k8s_api_connect_timeout, args.k8s_api_read_timeout),
+        "proxies": _proxy(args.api_server_proxy),
+    }
+    with requests.Session() as session:
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        vms = _list_items(session, args.api_server_endpoint, "/apis/kubevirt.io/v1/virtualmachines", **kwargs)
+        vmis = _list_items(session, args.api_server_endpoint, "/apis/kubevirt.io/v1/virtualmachineinstances", **kwargs)
+    vmis_by_key = {((vmi.get("metadata") or {}).get("namespace"), (vmi.get("metadata") or {}).get("name")): vmi for vmi in vmis}
+    for vm in vms:
+        meta = vm.get("metadata", {}) or {}
+        namespace = str(meta.get("namespace", "default"))
+        name = str(meta.get("name"))
+        if not _monitor_namespace(namespace, args.namespace_include_patterns, args.namespace_exclude_patterns):
+            continue
+        piggyback = f"virtualmachine_{args.cluster}_{namespace}_{name}"
+        sections = _vm_section_data(vm, vmis_by_key.get((namespace, name)), args.cluster, args.kubernetes_cluster_hostname, args.include_annotations_as_host_labels, args.include_matching_annotations_as_host_labels)
+        _write_pb(piggyback, sections)
+
+
+def prom_query(session: requests.Session, base_url: str, promql: str, **kwargs: Any) -> list[Mapping[str, Any]]:
+    data = _get_json(session, base_url.rstrip("/") + "/api/v1/query", params={"query": promql}, **kwargs)
+    if data.get("status") != "success":
+        LOG.warning("Prometheus query failed: %s", promql)
+        return []
+    result = ((data.get("data") or {}).get("result") or [])
+    return [sample for sample in result if isinstance(sample, Mapping)]
+
+
+def _value(sample: Mapping[str, Any]) -> float:
+    value = sample.get("value", [0, 0])
+    try:
+        return float(value[1])
+    except Exception:
+        return 0.0
+
+
+def _metric(sample: Mapping[str, Any]) -> Mapping[str, Any]:
+    metric = sample.get("metric") or {}
+    return metric if isinstance(metric, Mapping) else {}
+
+
+def _vm_key(metric: Mapping[str, Any]) -> tuple[str, str]:
+    return (str(metric.get("exported_namespace") or metric.get("namespace") or "default"), str(metric.get("name") or metric.get("domain") or metric.get("vm") or "unknown"))
+
+
+def collect_prometheus(args: argparse.Namespace, token: str) -> None:
+    if not args.prometheus_endpoint:
+        return
+    if not args.usage_verify_cert:
+        LOG.warning("Disabling SSL certificate verification for Prometheus endpoint.")
+    kwargs = {
+        "verify": args.usage_verify_cert,
+        "timeout": (args.usage_connect_timeout, args.usage_read_timeout),
+        "proxies": _proxy(args.usage_proxy),
+    }
+    with requests.Session() as session:
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        results = {name: prom_query(session, args.prometheus_endpoint, query, **kwargs) for name, query in KUBEVIRT_QUERIES.items()}
+
+    per_vm: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"net": defaultdict(dict), "disk": defaultdict(dict)})
+    for sample in results["cpu"]:
+        per_vm[_vm_key(_metric(sample))]["cpu"] = _value(sample)
+    for sample in results["memory"]:
+        per_vm[_vm_key(_metric(sample))]["memory"] = _value(sample)
+    for key, field in [("net_rx", "receive_bytes_per_second"), ("net_tx", "transmit_bytes_per_second")]:
+        for sample in results[key]:
+            metric = _metric(sample)
+            per_vm[_vm_key(metric)]["net"][str(metric.get("interface", "default"))][field] = _value(sample)
+    for key, field in [("disk_read", "read_bytes_per_second"), ("disk_write", "write_bytes_per_second")]:
+        for sample in results[key]:
+            metric = _metric(sample)
+            per_vm[_vm_key(metric)]["disk"][str(metric.get("drive", "unknown"))][field] = _value(sample)
+
+    for (namespace, name), values in per_vm.items():
+        sections = {}
+        if "cpu" in values:
+            sections["kubevirt_vm_cpu_v1"] = {"usage": values["cpu"]}
+        if "memory" in values:
+            sections["kubevirt_vm_memory_v1"] = {"resident_bytes": values["memory"]}
+        if values["net"]:
+            sections["kubevirt_vm_network_v1"] = {"interfaces": [{"interface": iface, "receive_bytes_per_second": data.get("receive_bytes_per_second", 0.0), "transmit_bytes_per_second": data.get("transmit_bytes_per_second", 0.0)} for iface, data in values["net"].items()]}
+        if values["disk"]:
+            sections["kubevirt_vm_disk_v1"] = {"drives": [{"drive": drive, "read_bytes_per_second": data.get("read_bytes_per_second", 0.0), "write_bytes_per_second": data.get("write_bytes_per_second", 0.0)} for drive, data in values["disk"].items()]}
+        if sections:
+            _write_pb(f"virtualmachine_{args.cluster}_{namespace}_{name}", sections)
+
+    # Platform sections are written to the main host.
+    platform = {}
+    if results["version"]:
+        platform["kubevirt_version_v1"] = {"labels": dict(_metric(results["version"][0]))}
+    platform["kubevirt_component_health_v1"] = {"targets": [{"component": str(_metric(s).get("pod") or _metric(s).get("container") or _metric(s).get("job") or "unknown").split("-")[0], "pod": _metric(s).get("pod"), "namespace": _metric(s).get("namespace"), "up": _value(s)} for s in results["component_up"]]}
+    platform["kubevirt_controller_status_v1"] = {"controller_leading": _value(results["controller_leading"][0]) if results["controller_leading"] else None, "controller_ready": _value(results["controller_ready"][0]) if results["controller_ready"] else None, "operator_leading": _value(results["operator_leading"][0]) if results["operator_leading"] else None, "operator_ready": _value(results["operator_ready"][0]) if results["operator_ready"] else None}
+    queues: dict[str, dict[str, float | str]] = defaultdict(lambda: {"depth": 0.0, "adds_per_second": 0.0, "retries_per_second": 0.0, "unfinished_work_seconds": 0.0})
+    for qname, field in [("workqueue_depth", "depth"), ("workqueue_adds", "adds_per_second"), ("workqueue_retries", "retries_per_second"), ("workqueue_unfinished", "unfinished_work_seconds")]:
+        for sample in results[qname]:
+            metric = _metric(sample)
+            name = str(metric.get("name") or metric.get("queue") or metric.get("workqueue") or "unknown")
+            queues[name]["name"] = name
+            queues[name][field] = _value(sample)
+    platform["kubevirt_workqueues_v1"] = {"queues": list(queues.values())}
+    platform["kubevirt_migrations_v1"] = {"pending": _value(results["migrations_pending"][0]) if results["migrations_pending"] else 0.0, "running": _value(results["migrations_running"][0]) if results["migrations_running"] else 0.0, "scheduling": _value(results["migrations_scheduling"][0]) if results["migrations_scheduling"] else 0.0, "unset": _value(results["migrations_unset"][0]) if results["migrations_unset"] else 0.0}
+    platform["kubevirt_vmi_phase_count_v1"] = {"phases": {str(_metric(s).get("phase", "unknown")): _value(s) for s in results["vmi_phase_count"]}}
+    lifecycle = []
+    for key, status in [("vm_running", "running"), ("vm_starting", "starting"), ("vm_non_running", "non_running"), ("vm_migrating", "migrating"), ("vm_error", "error")]:
+        for sample in results[key]:
+            metric = _metric(sample)
+            lifecycle.append({"namespace": metric.get("exported_namespace") or metric.get("namespace"), "name": metric.get("name"), "status": status, "timestamp": _value(sample)})
+    platform["kubevirt_vm_lifecycle_v1"] = {"timestamps": lifecycle}
+    _write_pb("", platform)
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    args = parse_args(argv)
+    setup_logging(args.verbose)
+    LOG.debug("parsed arguments: %r", args)
+    if not args.verify_cert_api or (args.prometheus_endpoint and not args.usage_verify_cert):
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    try:
+        token = _resolve_token(args)
+        collect_api(args, token)
+        collect_prometheus(args, token)
+    except Exception as exc:
+        if args.debug:
+            raise
+        sys.stderr.write(str(exc) + "\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
